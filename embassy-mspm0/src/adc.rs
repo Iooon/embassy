@@ -19,16 +19,17 @@ pub struct InterruptHandler<T: Instance> {
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
-        // Ris is cleared upon reading iidx
+        // Mis is cleared upon reading iidx
         let iidx = T::info().regs.cpu_int(0).iidx().read().stat();
-        // TODO: Running in sequence mode, we get an interrupt per finished result. It is desirable
-        // to only wake up after all results are finished.
+        // TODO: Running in sequence mode, we get an interrupt per finished result. It would be
+        // nice to wake up only after all results are finished.
         if vals::CpuIntIidxStat::MEMRESIFG0 <= iidx && iidx <= vals::CpuIntIidxStat::MEMRESIFG23 {
             T::state().waker.wake();
         }
     }
 }
 
+// Constants from the metapac crate
 const ADC_VRSEL: u8 = crate::_generated::ADC_VRSEL;
 const ADC_MEMCTL: u8 = crate::_generated::ADC_MEMCTL;
 
@@ -47,6 +48,7 @@ pub enum Resolution {
 }
 
 impl Resolution {
+    /// Number of bits of the resolution.
     pub fn bits(&self) -> u8 {
         match self {
             Resolution::BIT12 => 12,
@@ -56,8 +58,11 @@ impl Resolution {
     }
 }
 
+/// The ADC voltage reference (Vref) selection.
 pub use crate::_generated::Vrsel;
 
+/// ADC configuration. The vr_select is used when reading a single channel. When reading a sequence
+/// the vr_select is provided per channel.
 pub struct AdcConfig {
     pub resolution: Resolution,
     pub vr_select: Vrsel,
@@ -76,6 +81,7 @@ pub struct Adc<'d, T: Instance, M: Mode> {
 }
 
 impl<'d, T: Instance> Adc<'d, T, Blocking> {
+    /// A new blocking ADC driver instance.
     pub fn new_blocking(peri: Peri<'d, T>, config: AdcConfig) -> Self {
         let mut this = Self {
             adc: peri,
@@ -90,6 +96,7 @@ impl<'d, T: Instance> Adc<'d, T, Blocking> {
 }
 
 impl<'d, T: Instance> Adc<'d, T, Async> {
+    /// A new asynchronous ADC driver instance.
     pub fn new_async(
         peri: Peri<'d, T>,
         config: AdcConfig,
@@ -221,6 +228,7 @@ impl<'d, T: Instance, M: Mode> Adc<'d, T, M> {
         self.info.regs.memres(channel_id).read().data()
     }
 
+    /// Read one ADC channel in blocking mode using the config provided at initialization.
     pub fn blocking_read(&mut self, channel: &mut impl AdcChannel<T>) -> u16 {
         self.setup_blocking_channel(channel);
         self.enable_conversion();
@@ -271,7 +279,7 @@ impl<'d, T: Instance> Adc<'d, T, Async> {
         });
     }
 
-    /// Read one ADC channels using the memres interrupt.
+    /// Read one ADC channel asynchronously using the config provided at initialization.
     pub async fn read_channel(&mut self, channel: &mut impl AdcChannel<T>) -> u16 {
         channel.setup();
 
@@ -292,13 +300,13 @@ impl<'d, T: Instance> Adc<'d, T, Async> {
         self.conversion_result(Self::SINGLE_CHANNEL as usize)
     }
 
-    /// Read one or multiple ADC channels using the memres interrupts.
+    /// Read one or multiple ADC channels using the Vrsel provided per channel.
     ///
     /// `sequence` iterator and `readings` must have the same length.
     ///
     /// Example
     /// ```rust,ignore
-    /// use embassy_stm32::adc::{Adc, AdcChannel}
+    /// use embassy_mspm0::adc::{Adc, AdcChannel, Vrsel};
     ///
     /// let mut adc = Adc::new_async(p.ADC0, adc_config, Irqs);
     /// let pin1 = p.PA14.degrade_adc();
@@ -311,7 +319,7 @@ impl<'d, T: Instance> Adc<'d, T, Async> {
     ///     &mut readings,
     /// )
     /// .await;
-    /// defmt::info!("measurements: {}", measurements);
+    /// defmt::info!("Measurements: {}", readings);
     /// ```
     pub async fn read_sequence<'a>(
         &mut self,
@@ -358,8 +366,7 @@ pub trait Instance: SealedInstance + PeripheralType {
     type Interrupt: crate::interrupt::typelevel::Interrupt;
 }
 
-// ==== IMPL types ====
-
+/// Peripheral state.
 pub(crate) struct State {
     waker: AtomicWaker,
 }
@@ -372,6 +379,7 @@ impl State {
     }
 }
 
+/// Peripheral information.
 pub(crate) struct Info {
     pub(crate) regs: Regs,
     pub(crate) interrupt: Interrupt,
@@ -438,6 +446,7 @@ impl<T> AnyAdcChannel<T> {
 /// ADC channel.
 #[allow(private_bounds)]
 pub trait AdcChannel<T>: SealedAdcChannel<T> + Sized {
+    /// Allows an ADC channel to be converted into a type-erased `AnyAdcChannel`.
     #[allow(unused_mut)]
     fn degrade_adc(mut self) -> AnyAdcChannel<T> {
         self.setup();
