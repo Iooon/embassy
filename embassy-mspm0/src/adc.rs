@@ -73,8 +73,7 @@ pub struct AdcConfig {
     pub sample_time: u16,
 }
 
-/// ADC Driver.
-/// Analog to Digital driver.
+/// ADC (Analog to Digial Converter) Driver.
 pub struct Adc<'d, T: Instance, M: Mode> {
     #[allow(unused)]
     adc: crate::Peri<'d, T>,
