@@ -228,15 +228,15 @@ fn generate_adc_constants() -> TokenStream {
 
             #[derive(Clone, Copy, PartialEq, Eq, Debug)]
             #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-            /// Reference voltage selection for the ADC channels.
+            /// Reference voltage (Vref) selection for the ADC channels.
             pub enum Vrsel {
-                // VDDA reference
+                /// VDDA reference
                 VddaVssa = 0,
 
-                // External reference from pin
+                /// External reference from pin
                 ExtrefVrefm = 1,
 
-                // Internal reference
+                /// Internal reference
                 IntrefVssa = 2,
             }
         }
@@ -247,21 +247,21 @@ fn generate_adc_constants() -> TokenStream {
 
             #[derive(Clone, Copy, PartialEq, Eq, Debug)]
             #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-            /// Reference voltage selection for the ADC channels.
+            /// Reference voltage (Vref) selection for the ADC channels.
             pub enum Vrsel {
-                // VDDA reference
+                /// VDDA reference
                 VddaVssa = 0,
 
-                // External reference from pin
+                /// External reference from pin
                 ExtrefVrefm = 1,
 
-                // Internal reference
+                /// Internal reference
                 IntrefVssa = 2,
 
-                // VDDA and VREFM connected to VREF+ and VREF- of ADC
+                /// VDDA and VREFM connected to VREF+ and VREF- of ADC
                 VddaVrefm = 3,
 
-                // INTREF and VREFM connected to VREF+ and VREF- of ADC
+                /// INTREF and VREFM connected to VREF+ and VREF- of ADC
                 IntrefVrefm = 4,
             }
         }

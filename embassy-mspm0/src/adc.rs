@@ -37,13 +37,13 @@ const ADC_MEMCTL: u8 = crate::_generated::ADC_MEMCTL;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 /// Conversion resolution of the ADC results.
 pub enum Resolution {
-    // 12-bits resolution
+    /// 12-bits resolution
     BIT12,
 
-    // 10-bits resolution
+    /// 10-bits resolution
     BIT10,
 
-    // 8-bits resolution
+    /// 8-bits resolution
     BIT8,
 }
 
@@ -58,14 +58,18 @@ impl Resolution {
     }
 }
 
-/// The ADC voltage reference (Vref) selection.
 pub use crate::_generated::Vrsel;
 
-/// ADC configuration. The vr_select is used when reading a single channel. When reading a sequence
-/// the vr_select is provided per channel.
+/// ADC configuration.
 pub struct AdcConfig {
+    /// Resolution of the ADC conversion. The number of bits used to represent an ADC measurement.
     pub resolution: Resolution,
+    /// ADC voltage reference selection.
+    ///
+    /// This value is used when reading a single channel. When reading a sequence
+    /// the vr_select is provided per channel.
     pub vr_select: Vrsel,
+    /// The sample time in number of ADC sample clock cycles.
     pub sample_time: u16,
 }
 
@@ -438,7 +442,7 @@ impl<T: Instance> SealedAdcChannel<T> for AnyAdcChannel<T> {
 
 impl<T> AnyAdcChannel<T> {
     #[allow(unused)]
-    pub fn get_hw_channel(&self) -> u8 {
+    pub(crate) fn get_hw_channel(&self) -> u8 {
         self.channel
     }
 }
@@ -446,7 +450,7 @@ impl<T> AnyAdcChannel<T> {
 /// ADC channel.
 #[allow(private_bounds)]
 pub trait AdcChannel<T>: SealedAdcChannel<T> + Sized {
-    /// Allows an ADC channel to be converted into a type-erased `AnyAdcChannel`.
+    /// Allows an ADC channel to be converted into a type-erased [`AnyAdcChannel`].
     #[allow(unused_mut)]
     fn degrade_adc(mut self) -> AnyAdcChannel<T> {
         self.setup();
