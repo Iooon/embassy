@@ -1,7 +1,7 @@
-//! This example uses FIFO with polling, and the maximum FIFO size is 8.
-//! Refer to async example to handle larger packets.
+//! This example writes a burst larger than the 8 byte FIFO: all 16 channels of
+//! a (pre-configured, auto-increment enabled) PCA9685 PWM controller in one go.
 //!
-//! This example controls AD5171 digital potentiometer via I2C with the LP-MSPM0L1306 board.
+//! Uses the LP-MSPM0L1306 board.
 
 #![no_std]
 #![no_main]
@@ -13,7 +13,9 @@ use embassy_mspm0::i2c::{Config, I2c};
 use embassy_time::Timer;
 use panic_halt as _;
 
-const ADDRESS: u8 = 0x2c;
+const ADDRESS: u8 = 0x40;
+/// First of the four registers (ON_L, ON_H, OFF_L, OFF_H) of channel 0.
+const LED0_ON_L: u8 = 0x06;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
@@ -25,22 +27,22 @@ async fn main(_spawner: Spawner) -> ! {
 
     let mut i2c = unwrap!(I2c::new_blocking(instance, scl, sda, Config::default()));
 
-    let mut pot_value: u8 = 0;
+    let mut duty: u16 = 0;
 
     loop {
-        let to_write = [0u8, pot_value];
+        // Register pointer plus 16 channels of ON = 0, OFF = duty.
+        let mut to_write = [0u8; 1 + 16 * 4];
+        to_write[0] = LED0_ON_L;
+        for ch in 0..16 {
+            to_write[3 + ch * 4..5 + ch * 4].copy_from_slice(&duty.to_le_bytes());
+        }
 
         match i2c.blocking_write(ADDRESS, &to_write) {
-            Ok(()) => info!("New potentioemter value: {}", pot_value),
+            Ok(()) => info!("Wrote {} bytes, duty {}", to_write.len(), duty),
             Err(e) => error!("I2c Error: {:?}", e),
         }
 
-        pot_value += 1;
-        // if reached 64th position (max)
-        // start over from lowest value
-        if pot_value == 64 {
-            pot_value = 0;
-        }
+        duty = (duty + 256) % 4096;
         Timer::after_millis(500).await;
     }
 }
