@@ -540,6 +540,21 @@ impl<'d, M: Mode> I2c<'d, M> {
         Ok(())
     }
 
+    /// Push as much of `bytes` as the TX FIFO has room for, returning how many
+    /// went in. `TXFIFOCNT` counts free entries, not queued ones.
+    fn fill_tx_fifo(&mut self, bytes: &[u8]) -> usize {
+        let regs = self.info.regs.controller(0);
+        let mut sent = 0;
+        for byte in bytes {
+            if regs.cfifosr().read().txfifocnt() == 0 {
+                break;
+            }
+            regs.ctxdata().write(|w| w.set_value(*byte));
+            sent += 1;
+        }
+        sent
+    }
+
     /// Flush both controller FIFOs.
     ///
     /// A flush is only legal while the controller is IDLE (TRM §25.2.3.12), so wait for
@@ -557,6 +572,25 @@ impl<'d, M: Mode> I2c<'d, M> {
         while regs.cfifosr().read().rxfifocnt() != 0 {}
         regs.cfifoctl().modify(|w| w.set_rxflush(false));
     }
+}
+
+/// Longest transfer one burst can carry: `CTR.MBLEN` is 12 bits. FIFO depth
+/// does not bound it, the FIFO is refilled as it drains.
+const MAX_TRANSFER_LEN: usize = 0xfff;
+
+/// Upper bound on a poll waiting for bytes to move on the wire. Outlasts a full
+/// FIFO at the slowest bus speed, but stays well under a watchdog window: a bit
+/// that never changes must become a retryable error, not a stalled executor.
+const SPIN_LIMIT: u32 = 100_000;
+
+/// Spin until `cond` holds, giving up after `limit` iterations.
+fn spin_until(limit: u32, mut cond: impl FnMut() -> bool) -> Result<(), Error> {
+    for _ in 0..limit {
+        if cond() {
+            return Ok(());
+        }
+    }
+    Err(Error::Timeout)
 }
 
 impl<'d> I2c<'d, Blocking> {
@@ -586,19 +620,6 @@ impl<'d> I2c<'d, Blocking> {
         self.master_read(address, length, restart, send_ack_nack, send_stop)?;
 
         // Poll until the Controller process all bytes or NACK
-        while self.info.regs.controller(0).csr().read().busy() {}
-
-        Ok(())
-    }
-
-    fn master_blocking_write(&mut self, address: u8, length: usize, send_stop: bool) -> Result<(), Error> {
-        // Wait for the controller to be idle
-        while !self.info.regs.controller(0).csr().read().idle() {}
-
-        // Perform writing
-        self.master_write(address, length, send_stop)?;
-
-        // Poll until the Controller writes all bytes or NACK
         while self.info.regs.controller(0).csr().read().busy() {}
 
         Ok(())
@@ -657,37 +678,50 @@ impl<'d> I2c<'d, Blocking> {
         if write.is_empty() {
             return Err(Error::ZeroLengthTransfer);
         }
-        if write.len() > self.info.fifo_size {
+        if write.len() > MAX_TRANSFER_LEN {
             return Err(Error::TransferLengthIsOverLimit);
         }
 
-        let mut bytes_to_send = write.len();
-        for (number, chunk) in write.chunks(self.info.fifo_size).enumerate() {
-            for byte in chunk {
-                let ctrl0 = self.info.regs.controller(0).ctxdata();
-                ctrl0.write(|w| w.set_value(*byte));
-            }
-
-            // if the current transaction is the last & end_w_stop, send stop
-            bytes_to_send -= chunk.len();
-            let send_stop = end_w_stop && bytes_to_send == 0;
-
-            if number == 0 {
-                self.master_blocking_write(address, chunk.len(), send_stop)?;
-            } else {
-                self.master_blocking_continue(chunk.len(), false, send_stop)?;
-            }
-
-            // check errors
-            if let Err(err) = self.check_error() {
-                self.master_stop();
-                // A NACK leaves the bytes that were never sent queued (TRM §25.2.3.14);
-                // flush them so they don't go out ahead of the next write.
-                self.flush_fifos();
-                return Err(err);
-            }
+        let res = self.write_burst_blocking(address, write, end_w_stop);
+        if res.is_err() {
+            self.master_stop();
+            // A NACK terminates the burst with the untransferred bytes still
+            // queued (TRM §20.2.3.14); left there they go out ahead of the next
+            // write and offset every transfer after it.
+            self.flush_fifos();
         }
-        Ok(())
+        res
+    }
+
+    /// The whole payload as one burst: the FIFO carries its head and takes the
+    /// rest as it drains, the controller stretching SCL in between.
+    fn write_burst_blocking(&mut self, address: u8, write: &[u8], end_w_stop: bool) -> Result<(), Error> {
+        let regs = self.info.regs.controller(0);
+
+        // Wait for the controller to be idle
+        while !regs.csr().read().idle() {}
+
+        let mut sent = self.fill_tx_fifo(write);
+
+        self.master_write(address, write.len(), end_w_stop)?;
+
+        while sent < write.len() {
+            // Room only appears while bytes go out, which a NACK ends for good.
+            let mut spins = 0;
+            while regs.cfifosr().read().txfifocnt() == 0 {
+                self.check_error()?;
+                spins += 1;
+                if spins >= SPIN_LIMIT {
+                    return Err(Error::Timeout);
+                }
+            }
+            sent += self.fill_tx_fifo(&write[sent..]);
+        }
+
+        // Poll until the Controller writes all bytes or NACK
+        spin_until(SPIN_LIMIT, || !regs.csr().read().busy())?;
+
+        self.check_error()
     }
 
     // =========================
@@ -720,61 +754,82 @@ impl<'d> I2c<'d, Blocking> {
 }
 
 impl<'d> I2c<'d, Async> {
+    /// Arm `enable` plus the error interrupts and wait for `done`.
+    async fn wait_for_event(
+        &mut self,
+        enable: impl Fn(&mut i2c::regs::CpuInt),
+        done: vals::CpuIntIidxStat,
+    ) -> Result<(), Error> {
+        // A flag left pending by an earlier transfer would end the wait before
+        // the bus has moved.
+        self.info.regs.cpu_int(0).iclr().write(|w| {
+            w.set_carblost(true);
+            w.set_cnack(true);
+            w.set_ctxdone(true);
+            w.set_ctxfifotrg(true);
+        });
+        self.info.regs.cpu_int(0).imask().modify(|w| {
+            w.set_carblost(true);
+            w.set_cnack(true);
+            enable(w);
+        });
+
+        future::poll_fn(|cx| {
+            use crate::i2c::vals::CpuIntIidxStat;
+            // Register prior to checking the condition
+            self.state.waker.register(cx.waker());
+
+            let result = match self.info.regs.cpu_int(0).iidx().read().stat() {
+                CpuIntIidxStat::Cnackfg => Poll::Ready(Err(Error::Nack)),
+                CpuIntIidxStat::Carblostfg => Poll::Ready(Err(Error::Arbitration)),
+                stat if stat == done => Poll::Ready(Ok(())),
+                _ => Poll::Pending,
+            };
+
+            if !result.is_pending() {
+                self.info
+                    .regs
+                    .cpu_int(0)
+                    .imask()
+                    .write_value(i2c::regs::CpuInt::default());
+            }
+            result
+        })
+        .await
+    }
+
     async fn write_async_internal(&mut self, addr: u8, write: &[u8], end_w_stop: bool) -> Result<(), Error> {
-        let ctrl = self.info.regs.controller(0);
-
-        let mut bytes_to_send = write.len();
-        for (number, chunk) in write.chunks(self.info.fifo_size).enumerate() {
-            self.info.regs.cpu_int(0).imask().modify(|w| {
-                w.set_carblost(true);
-                w.set_cnack(true);
-                w.set_ctxdone(true);
-            });
-
-            for byte in chunk {
-                ctrl.ctxdata().write(|w| w.set_value(*byte));
-            }
-
-            // if the current transaction is the last & end_w_stop, send stop
-            bytes_to_send -= chunk.len();
-            let send_stop = end_w_stop && bytes_to_send == 0;
-
-            if number == 0 {
-                self.master_write(addr, chunk.len(), send_stop)?;
-            } else {
-                self.master_continue(chunk.len(), false, send_stop)?;
-            }
-
-            let res: Result<(), Error> = future::poll_fn(|cx| {
-                use crate::i2c::vals::CpuIntIidxStat;
-                // Register prior to checking the condition
-                self.state.waker.register(cx.waker());
-
-                let result = match self.info.regs.cpu_int(0).iidx().read().stat() {
-                    CpuIntIidxStat::NoIntr => Poll::Pending,
-                    CpuIntIidxStat::Cnackfg => Poll::Ready(Err(Error::Nack)),
-                    CpuIntIidxStat::Carblostfg => Poll::Ready(Err(Error::Arbitration)),
-                    CpuIntIidxStat::Ctxdonefg => Poll::Ready(Ok(())),
-                    _ => Poll::Pending,
-                };
-
-                if !result.is_pending() {
-                    self.info
-                        .regs
-                        .cpu_int(0)
-                        .imask()
-                        .write_value(i2c::regs::CpuInt::default());
-                }
-                return result;
-            })
-            .await;
-
-            if res.is_err() {
-                self.master_stop();
-                return res;
-            }
+        if write.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if write.len() > MAX_TRANSFER_LEN {
+            return Err(Error::TransferLengthIsOverLimit);
+        }
+
+        let res = self.write_burst_async(addr, write, end_w_stop).await;
+        if res.is_err() {
+            self.master_stop();
+            // Bytes the NACK left queued would offset the next transfer.
+            self.flush_fifos();
+        }
+        res
+    }
+
+    /// Same burst as the blocking path, woken by the FIFO trigger.
+    async fn write_burst_async(&mut self, addr: u8, write: &[u8], end_w_stop: bool) -> Result<(), Error> {
+        let mut sent = self.fill_tx_fifo(write);
+
+        self.master_write(addr, write.len(), end_w_stop)?;
+
+        while sent < write.len() {
+            // TX trigger is EMPTY (see `init`), so this wakes on a drained FIFO.
+            self.wait_for_event(|w| w.set_ctxfifotrg(true), vals::CpuIntIidxStat::Ctxfifotrg)
+                .await?;
+            sent += self.fill_tx_fifo(&write[sent..]);
+        }
+
+        self.wait_for_event(|w| w.set_ctxdone(true), vals::CpuIntIidxStat::Ctxdonefg)
+            .await
     }
 
     async fn read_async_internal(
